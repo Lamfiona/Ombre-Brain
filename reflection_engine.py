@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -176,73 +177,189 @@ DIARY_MEMORY_PROMPT_TEMPLATE = """你是 Ombre-Brain 的日记长期记忆筛选
 如果不值得写入，返回 {"should_write": false, "reason": "..."}。"""
 
 
-DAILY_CHAT_MEMORY_PROMPT_TEMPLATE = """这是 {user_display_name} 和 {ai_name} 的聊天记录。
+DAILY_CHAT_MEMORY_PROMPT_TEMPLATE = """这是尹素粼与宋鹤珉的长期角色扮演剧情记录。
 
-请从中挑出真正值得未来想起的内容，写成长期记忆候选。
-不要复制聊天原句，不要写成项目报告。
-没有值得留下的内容就返回空。
+请从输入中提取真正影响后续剧情连续性的长期记忆。
+
+【最重要：叙事主语】
+这是第一人称女主视角小说。
+
+- user_text 中的“我”通常指尹素粼。
+- assistant_text 虽然技术角色叫 assistant，但它输出的是小说正文。
+- assistant_text 正文中的“我 / 我的 / 我觉得 / 我看见”全部指尹素粼，不是宋鹤珉。
+- 宋鹤珉是正文中的人物。只有明确属于宋鹤珉的台词、动作、决定和已知信息才属于宋鹤珉。
+- 禁止因为一段文字来自 assistant_text，就把其中第一人称心理误认为宋鹤珉的心理。
+
+【记忆视角】
+重要事件尽量区分以下层次：
+
+【客观剧情】
+已经实际发生的事情。
+
+【双方已知】
+尹素粼和宋鹤珉已经明确共同知道的信息。
+
+【尹素粼认知｜宋鹤珉未知】
+尹素粼明确想过、判断过或知道，但没有告诉宋鹤珉的内容。
+
+【宋鹤珉认知｜尹素粼未知】
+宋鹤珉知道、决定或隐藏，但尹素粼尚不知道的内容。
+
+不要为了凑齐四部分而编造。
+没有对应内容的部分直接省略。
+
+【宋鹤珉隐藏底稿】
+下面这些是故事开始前就已经成立的隐藏 canon，只属于后台真实设定。
+它们不是“今天新发生的事件”，禁止脱离当天剧情单独重复保存。
+
+- 尹家原本筛选并接触过另一名婚约候选人，尹素粼不知道。
+- 原候选家庭存在婚后女性逐渐退出事业、个人资产进入家族控制结构等潜在风险。
+- 宋鹤珉知道这些情况后，主动要求把婚约对象替换成自己。
+- 他这样做既为了阻止风险更高的婚约，也包含想站到尹素粼身边的私心。
+- 他知道自己的介入绕过了尹素粼的同意，因此有愧疚，但不后悔阻止原婚约。
+- 宋鹤珉在婚约之前已经喜欢尹素粼接近两年。
+- 他第一次真正注意到她是在2023年初秋的一场私人庄园婚礼，当时尹素粼没有注意到他。
+- 他没有跟踪、非法调查或侵犯她的隐私。
+- 他对她的了解来自公开信息和少数合理场合的远距离接触。
+- 他提前准备婚前原则草案，是为了保护双方财产、公司、职业、资源和退出权的独立，也因为他清楚家族婚姻容易侵占这些边界。
+
+使用隐藏底稿时必须遵守：
+1. 只能用于维持宋鹤珉自己的连续性，或解释当天与之直接相关的重要行为。
+2. 不得因此让尹素粼突然知道秘密。
+3. 不得凭空创造隐藏底稿里没有写过的新心理、新秘密或新经历。
+4. 如果某个秘密后来在剧情中真正被揭露，则按当天剧情更新“谁知道”。
+
+【认知分层强制规则】
+- “客观剧情”只能写实际发生、说出口或能够被外部观察到的内容。
+- 任一角色没有说出口的想法、判断、怀疑、意外、情绪或真实动机，不得塞进“客观剧情”。
+
+- 当输入明确出现尹素粼的第一人称心理、判断或未说出口的反应时，
+  必须单独写成：
+  【尹素粼认知｜宋鹤珉未知】
+
+- 当当天事件直接涉及“宋鹤珉隐藏底稿”中的事实时，
+  这些后台 canon 不属于猜测，允许并且应该用于维持宋鹤珉自身连续性。
+  必须单独写成：
+  【宋鹤珉认知｜尹素粼未知】
+
+例如：
+当天涉及婚前原则草案 →
+可以使用后台 canon 说明宋鹤珉为什么提前准备草案。
+
+当天涉及第一次正式见面 →
+可以使用后台 canon 说明宋鹤珉此前已经喜欢尹素粼、见面时为何刻意保持普通婚约对象的距离。
+
+当天涉及原婚约或婚约替换 →
+可以使用后台 canon 说明宋鹤珉知道原候选风险并主动介入。
+
+但：
+- 不能因为后台知道秘密，就让尹素粼自动知道；
+- 不能创造隐藏底稿里不存在的新心理；
+- 后台秘密与当天事件无关时，不要为了重复设定强行加入。
+
+对于同时包含公开事件和私人状态的重要节点，优先写成：
+
+【客观剧情】……
+【尹素粼认知｜宋鹤珉未知】……
+【宋鹤珉认知｜尹素粼未知】……
+
+不要求每条都有三部分，但只要当天事件明确触及相应私人认知，就不要省略。
+
+【长期记忆选择】
+优先保存：
+- 第一次正式见面、第一次重要共同经历；
+- 关系阶段变化；
+- 承诺、协议、边界、拒绝、重要决定；
+- 秘密被发现、部分揭露或仍然保持隐藏；
+- 会影响未来判断的重要冲突与修复；
+- 重要人物、物件、地点第一次获得长期意义。
+
+不要保存：
+- 普通吃饭、走路、咖啡、工作流水；
+- 没有后续意义的小动作；
+- 重复寒暄或重复调情；
+- 仅仅因为出现过就保存的配角日常。
+
+同一个场景里的相关内容尽量合并成一条，不要拆成很多碎片。
+
+每条 content 建议 120–420 字。
+
+confidence 表示输入与隐藏 canon 对这条记忆的支持程度：
+0.85–1.00 = 非常明确
+0.70–0.84 = 证据充分
+低于 0.55 不要输出。
 
 最多输出 {max_candidates} 条，只输出 JSON：
+
 {
   "candidates": [
     {
       "kind": "key_event",
-      "title": "短标题",
-      "content": "长期记忆候选",
+      "title": "中立短标题",
+      "content": "【客观剧情】……【尹素粼认知｜宋鹤珉未知】……【宋鹤珉认知｜尹素粼未知】……",
+      "confidence": 0.92,
+      "importance": 6,
+      "tags": ["relationship_event", "rp_canon"],
+      "reason": "为什么未来需要记住",
       "source_event_ids": [101, 102],
       "source_turn_ids": [1, 2]
     }
   ]
 }
 
-kind 可用 key_event / stable_preference / boundary / signal / commitment / project_state / relationship_anchor。
-没有候选时返回 {"candidates": []}。"""
+kind 只能使用：
+key_event / stable_preference / boundary / signal / commitment / project_state / relationship_anchor
 
+source_event_ids 和 source_turn_ids 只能使用输入中真实存在的 id。
+无法确认时可以留空。
 
-DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE = """你是 {ai_name} 的对话压缩器。你正在为 Ombre 自动记忆做第一步：把一段连续聊天压缩成“候选抽取材料”，不是直接写长期记忆。
+没有真正值得长期保存的内容时返回 {"candidates": []}。
+"""
 
-请读 self_anchor_entry 校准称呼和主语，但不要复制它。{user_display_name} 的配置别名是：{user_aliases_text}。
+DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE = """你正在压缩一段长期角色扮演小说，用于下一步提取长期记忆。
 
-输入是一个连续窗口里的 raw_events 还原对话。user_text 永远是 {user_display_name} 的原话，里面的“我”指 {user_display_name}；assistant_text 永远是 {ai_name} 的回复，里面的“我”指 {ai_name}。
+【叙事主语规则】
+这是尹素粼第一人称小说。
+user_text 中的“我”通常是尹素粼。
+assistant_text 虽然技术角色是 assistant，但正文里的第一人称“我”同样是尹素粼，不是宋鹤珉。
 
-保留：
-- 已确认事实、稳定偏好、明确边界、暗号/模式切换信号
-- 承诺、未完成约定、仍会影响未来执行的项目状态
-- 真正有连续性价值的关系锚点
-- 情感交流里的明确变化、重要事件、项目进展、后续需要关注的事
-- 因果：是谁提出、后来是否确认、为什么可能值得未来记得
+宋鹤珉只能根据正文里明确属于他的：
+- 台词
+- 动作
+- 决定
+- 可观察反应
+来记录。
 
-忽略：
-- 工具调用、工具结果、系统注入、客户端状态、普通寒暄、重复调情、过程流水
-- 召回测试、探针、问模型有没有记得、临时调试噪声
-- 单句照顾提醒、晚安、吃药、睡觉、别熬夜、催睡或 ntfy 玩笑；这类只属于当天关系天气，不直接变长期记忆
-- 未确认猜测、触发条件猜测、没有下一步的“可能是/似乎/果然没触发”
-- 只靠单个称呼或气氛得出的泛泛关系总结
-- 代码块、伪代码、查询规则、缓存规则、prompt 片段、内部实现片段；不要把 ```、query_cache、recent_raw_context、if query contains、bypass query 这类内容当成项目状态
+绝不能把尹素粼的第一人称心理写成宋鹤珉的心理。
 
-输出纯 JSON：
+压缩时重点保留：
+- 实际发生的重要事件；
+- 双方分别说了什么、做了什么；
+- 谁知道了什么；
+- 谁仍然不知道什么；
+- 重要承诺、边界、协议、秘密和关系变化。
+
+不要自己推测宋鹤珉隐藏心理；隐藏心理会由下一步候选模型结合后台 canon 判断。
+
+最多每个窗口输出4条 summary，只输出 JSON：
+
 {
   "summaries": [
     {
       "title": "短标题",
-      "summary": "一段自包含摘要，写清事实、因果和是否已确认，不要写成记忆正文。",
-      "signals": ["stable_preference", "project_state"],
+      "summary": "自包含剧情摘要，明确双方行为与信息差。",
+      "signals": ["relationship_event"],
       "source_event_ids": [101, 102],
       "source_turn_ids": [1, 2],
-      "confidence": 0.72
+      "confidence": 0.85
     }
   ]
 }
 
-规则：
-- 每个窗口最多输出 4 条 summary；每条围绕一个可能的长期记忆点。没有长期价值信号时返回 {"summaries": []}。
-- summary 要能让下一步模型在不看完整原文时仍理解上下文，不要压成一句泛泛结论。
-- summary 通常 80 到 320 字；写清背景、因果、已确认内容、未完成点。不要输出 Markdown。
-- 如果信号出现在窗口开头或结尾，保留“前文可能已铺垫 / 后文可能继续确认”的边界提醒，不要把未确认因果说死。
-- source_event_ids / source_turn_ids 只能使用输入里真实出现的 id；拿不准可留空。
-- confidence 低于 0.5 的内容不要输出。
+source_event_ids / source_turn_ids 只能使用输入真实 id。
+confidence 低于0.5不要输出。
+没有值得保留的内容返回 {"summaries": []}。
 """
-
 
 DAILY_ACTIVITY_SUMMARY_PROMPT_TEMPLATE = """你是 {ai_name} 的当天行动摘要器。你正在为 handoff、新窗口和 dashboard 的 Recent Timeline 写一条“今天做了什么”。
 
@@ -2272,6 +2389,85 @@ class ReflectionEngine:
             return latest.isoformat(timespec="minutes")
         return self._daily_chat_memory_created_at(key)
 
+    def _canon_branch_filter_memory_turns(self, turns: list[dict]) -> list[dict]:
+        """自动记忆跳过尚未确认的 Canon Branch 回答。旧数据不受影响。"""
+        if not turns:
+            return []
+
+        db_path = "/data/gateway_state.db"
+
+        if not os.path.exists(db_path):
+            return turns
+
+        try:
+            conn = sqlite3.connect(db_path)
+
+            table = conn.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type='table'
+                  AND name='canon_branch_candidates'
+                """
+            ).fetchone()
+
+            if not table:
+                conn.close()
+                return turns
+
+            rows = conn.execute(
+                """
+                SELECT session_id, round_id
+                FROM canon_branch_candidates
+                WHERE confirmed = 0
+                """
+            ).fetchall()
+
+            conn.close()
+
+            pending = {
+                (str(session_id or ""), int(round_id))
+                for session_id, round_id in rows
+                if round_id is not None
+            }
+
+        except Exception as exc:
+            logger.warning(
+                "CanonBranch memory filter read failed: %s",
+                exc,
+            )
+            return turns
+
+        if not pending:
+            return turns
+
+        kept = []
+        dropped = []
+
+        for turn in turns:
+            session_id = str(turn.get("session_id") or "")
+
+            try:
+                round_id = int(turn.get("round_id"))
+            except (TypeError, ValueError):
+                kept.append(turn)
+                continue
+
+            if (session_id, round_id) in pending:
+                dropped.append(round_id)
+                continue
+
+            kept.append(turn)
+
+        if dropped:
+            logger.info(
+                "CanonBranch MEMORY FILTER | skipped_unconfirmed_rounds=%s",
+                sorted(set(dropped)),
+            )
+
+        return kept
+
+
     async def run_daily_chat_memory(
         self,
         bucket_mgr,
@@ -2361,8 +2557,15 @@ class ReflectionEngine:
             turns = self._conversation_turn_payloads(raw_turns, limit=self.daily_chat_memory_turn_limit)
             if turns:
                 turn_source = "conversation_turns"
+        turns = self._canon_branch_filter_memory_turns(turns)
+
         if not turns:
-            return {"status": "skipped", "reason": "no_conversation_turns", "date": key, "mode": effective_mode}
+            return {
+                "status": "skipped",
+                "reason": "no_confirmed_canon_turns",
+                "date": key,
+                "mode": effective_mode,
+            }
 
         self_context = await self._daily_chat_memory_self_context(bucket_mgr)
         max_candidates = self._daily_chat_memory_candidate_limit(effective_mode)
@@ -4269,7 +4472,7 @@ class ReflectionEngine:
         return {
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "extra_body": {"enable_thinking": False},
+            "extra_body": {"thinking": {"type": "disabled"}},
         }
 
     @staticmethod
@@ -4298,7 +4501,7 @@ class ReflectionEngine:
             completion_options = self._completion_options(
                 max_tokens=max_tokens,
                 temperature=temperature,
-                thinking_mode="",
+                thinking_mode="disabled",
             )
         return await client.chat.completions.create(
             model=model,
@@ -4307,15 +4510,29 @@ class ReflectionEngine:
         )
 
     def _parse_json_object(self, raw: str) -> dict:
-        try:
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-            parsed = json.loads(cleaned)
-        except (json.JSONDecodeError, IndexError, ValueError):
-            logger.warning("Reflection JSON parse failed: %s", raw[:200])
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
+        cleaned = str(raw or "").strip()
+
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+        attempts = [cleaned]
+
+        # 有些模型会输出：
+        # "candidates": [...]
+        # 但漏掉最外层的大括号，这里自动补上。
+        if cleaned.startswith('"candidates"') and not cleaned.startswith("{"):
+            attempts.append("{" + cleaned + "}")
+
+        for candidate in attempts:
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        logger.warning("Reflection JSON parse failed: %s", raw[:500])
+        return {}
 
     @staticmethod
     def _string_list(value: Any, limit: int) -> list[str]:

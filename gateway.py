@@ -1884,6 +1884,11 @@ class GatewayService:
                 status_code=503,
             )
 
+        if isinstance(injection_debug, dict):
+            injection_debug["canon_branch_parent_hash"] = (
+                canon_branch_parent_hash
+            )
+
         if forward_payload.get("stream") is True:
             try:
                 return await self._stream_upstream(
@@ -3872,6 +3877,434 @@ class GatewayService:
             },
         )
 
+    def _canon_branch_request_hash(self, messages) -> str:
+        rows = []
+        if isinstance(messages, list):
+            for item in messages:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip()
+                if role not in {"user", "assistant"}:
+                    continue
+                content = self._coerce_message_text(item.get("content")).strip()
+                if content:
+                    rows.append([role, content])
+
+        if not rows:
+            return ""
+
+        return hashlib.sha256(
+            json.dumps(
+                rows,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+
+    def _canon_branch_selected_exchange(self, messages):
+        rows = []
+
+        if isinstance(messages, list):
+            for item in messages:
+                if not isinstance(item, dict):
+                    continue
+
+                role = str(item.get("role") or "").strip()
+
+                if role not in {"user", "assistant"}:
+                    continue
+
+                content = self._coerce_message_text(item.get("content")).strip()
+
+                if content:
+                    rows.append((role, content))
+
+        if not rows or rows[-1][0] != "user":
+            return None
+
+        assistant_index = None
+
+        for i in range(len(rows) - 2, -1, -1):
+            if rows[i][0] == "assistant":
+                assistant_index = i
+                break
+
+        if assistant_index is None:
+            return None
+
+        user_text = ""
+
+        for i in range(assistant_index - 1, -1, -1):
+            if rows[i][0] == "user":
+                user_text = rows[i][1]
+                break
+
+        assistant_text = rows[assistant_index][1]
+
+        if not user_text or not assistant_text:
+            return None
+
+        return {
+            "user_text": user_text,
+            "assistant_text": assistant_text,
+            "user_hash": hashlib.sha256(
+                user_text.encode("utf-8")
+            ).hexdigest(),
+            "assistant_hash": hashlib.sha256(
+                assistant_text.encode("utf-8")
+            ).hexdigest(),
+        }
+
+
+    def _canon_branch_connect(self):
+        conn = self.state_store._connect()
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS canon_branch_candidates (
+                session_id TEXT NOT NULL,
+                round_id INTEGER NOT NULL,
+                parent_hash TEXT NOT NULL,
+                user_hash TEXT NOT NULL,
+                assistant_hash TEXT NOT NULL,
+                user_text TEXT NOT NULL,
+                assistant_text TEXT NOT NULL,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, round_id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_canon_branch_lookup
+            ON canon_branch_candidates
+            (session_id, user_hash, assistant_hash, confirmed)
+            """
+        )
+
+        conn.commit()
+        return conn
+
+
+    def _canon_branch_record_candidate(
+        self,
+        session_id: str,
+        round_id: int,
+        parent_hash: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+
+        if not parent_hash or not user_text or not assistant_text:
+            return
+
+        conn = self._canon_branch_connect()
+
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO canon_branch_candidates (
+                    session_id,
+                    round_id,
+                    parent_hash,
+                    user_hash,
+                    assistant_hash,
+                    user_text,
+                    assistant_text,
+                    confirmed,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    session_id,
+                    int(round_id),
+                    parent_hash,
+                    hashlib.sha256(
+                        user_text.encode("utf-8")
+                    ).hexdigest(),
+                    hashlib.sha256(
+                        assistant_text.encode("utf-8")
+                    ).hexdigest(),
+                    user_text,
+                    assistant_text,
+                    datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+            conn.close()
+
+
+    async def _canon_branch_confirm_from_messages(
+        self,
+        session_id: str,
+        messages,
+    ) -> None:
+
+        selected = self._canon_branch_selected_exchange(messages)
+
+        if not selected:
+            return
+
+        conn = self._canon_branch_connect()
+
+        try:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM canon_branch_candidates
+                WHERE session_id = ?
+                  AND assistant_hash = ?
+                  AND confirmed = 0
+                ORDER BY round_id DESC
+                LIMIT 1
+                """,
+                (
+                    session_id,
+                    selected["assistant_hash"],
+                ),
+            ).fetchone()
+
+            if not row:
+                return
+
+            selected_round = int(row["round_id"])
+            parent_hash = str(row["parent_hash"])
+
+            sibling_rows = conn.execute(
+                """
+                SELECT round_id
+                FROM canon_branch_candidates
+                WHERE session_id = ?
+                  AND parent_hash = ?
+                  AND confirmed = 0
+                  AND round_id != ?
+                """,
+                (
+                    session_id,
+                    parent_hash,
+                    selected_round,
+                ),
+            ).fetchall()
+
+            sibling_rounds = [
+                int(item["round_id"])
+                for item in sibling_rows
+            ]
+
+            # -------------------------------------------------
+            # 删除 gateway_state 中未采用的版本
+            # -------------------------------------------------
+
+            if sibling_rounds:
+                placeholders = ",".join(
+                    "?" for _ in sibling_rounds
+                )
+
+                conn.execute(
+                    f"""
+                    DELETE FROM conversation_turns
+                    WHERE session_id = ?
+                      AND round_id IN ({placeholders})
+                    """,
+                    [session_id, *sibling_rounds],
+                )
+
+            # -------------------------------------------------
+            # 删除 raw_events 中未采用的版本
+            # -------------------------------------------------
+
+            if sibling_rounds:
+                raw_conn = self.raw_event_store._connect()
+
+                try:
+                    raw_rows = raw_conn.execute(
+                        """
+                        SELECT id, metadata_json
+                        FROM raw_events
+                        WHERE source = 'gateway'
+                          AND session_id = ?
+                        """,
+                        (session_id,),
+                    ).fetchall()
+
+                    delete_ids = []
+
+                    for raw_row in raw_rows:
+                        try:
+                            meta = json.loads(
+                                raw_row["metadata_json"] or "{}"
+                            )
+                        except Exception:
+                            meta = {}
+
+                        try:
+                            raw_round = int(
+                                meta.get("round_id")
+                            )
+                        except Exception:
+                            continue
+
+                        if raw_round in sibling_rounds:
+                            delete_ids.append(
+                                int(raw_row["id"])
+                            )
+
+                    if delete_ids:
+                        placeholders = ",".join(
+                            "?" for _ in delete_ids
+                        )
+
+                        raw_conn.execute(
+                            f"""
+                            DELETE FROM raw_events
+                            WHERE id IN ({placeholders})
+                            """,
+                            delete_ids,
+                        )
+
+                        # 重建全文索引，防止已删除废稿仍被搜到
+                        if getattr(
+                            self.raw_event_store,
+                            "fts_enabled",
+                            False,
+                        ):
+                            try:
+                                raw_conn.execute(
+                                    """
+                                    INSERT INTO raw_events_fts(
+                                        raw_events_fts
+                                    )
+                                    VALUES('rebuild')
+                                    """
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "CanonBranch FTS rebuild failed: %s",
+                                    exc,
+                                )
+
+                    raw_conn.commit()
+
+                finally:
+                    raw_conn.close()
+
+            # 选中的版本确认为 Canon
+            conn.execute(
+                """
+                UPDATE canon_branch_candidates
+                SET confirmed = 1
+                WHERE session_id = ?
+                  AND round_id = ?
+                """,
+                (
+                    session_id,
+                    selected_round,
+                ),
+            )
+
+            # 删除废弃分支的临时记录
+            if sibling_rounds:
+                placeholders = ",".join(
+                    "?" for _ in sibling_rounds
+                )
+
+                conn.execute(
+                    f"""
+                    DELETE FROM canon_branch_candidates
+                    WHERE session_id = ?
+                      AND round_id IN ({placeholders})
+                    """,
+                    [session_id, *sibling_rounds],
+                )
+
+            conn.commit()
+
+            # 只按已经确认的 Canon 轮次计算 Persona 更新频率。
+            try:
+                _cb_persona_interval = max(
+                    1,
+                    int(
+                        getattr(
+                            self.persona_engine,
+                            "evaluation_interval_rounds",
+                            3,
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                _cb_persona_interval = 3
+
+            _cb_canon_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM canon_branch_candidates
+                    WHERE session_id = ?
+                      AND confirmed = 1
+                    """,
+                    (session_id,),
+                ).fetchone()[0]
+                or 0
+            )
+
+            if (
+                self.persona_engine.enabled
+                and _cb_canon_count > 0
+                and _cb_canon_count % _cb_persona_interval == 0
+            ):
+                await self._update_persona_after_assistant_message(
+                    session_id=session_id,
+                    user_message=selected["user_text"],
+                    assistant_message={
+                        "role": "assistant",
+                        "content": selected["assistant_text"],
+                    },
+                    recalled_ids=[],
+                    canon_confirmed=True,
+                )
+
+                logger.info(
+                    "CanonBranch PERSONA APPLIED | session=%s round=%s canon_count=%s",
+                    session_id,
+                    selected_round,
+                    _cb_canon_count,
+                )
+            else:
+                logger.info(
+                    "CanonBranch PERSONA DEFERRED | session=%s round=%s canon_count=%s interval=%s",
+                    session_id,
+                    selected_round,
+                    _cb_canon_count,
+                    _cb_persona_interval,
+                )
+
+            logger.info(
+                "CanonBranch CONFIRMED | session=%s selected_round=%s deleted_rounds=%s",
+                session_id,
+                selected_round,
+                sibling_rounds,
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "CanonBranch confirm failed | session=%s error=%s",
+                session_id,
+                exc,
+            )
+
+        finally:
+            conn.close()
+
+
     async def _record_successful_round(
         self,
         session_id: str,
@@ -3951,6 +4384,43 @@ class GatewayService:
             client=client,
             route=route,
         )
+        try:
+            _cb_assistant_text = ""
+            if isinstance(assistant_message, dict):
+                _cb_assistant_text = self._coerce_message_text(
+                    assistant_message.get("content")
+                ).strip()
+
+            _cb_user_text = self._clean_conversation_turn_text(
+                user_message
+            )
+            _cb_assistant_text = self._clean_conversation_turn_text(
+                _cb_assistant_text
+            )
+
+            _cb_parent_hash = str(
+                (injection_debug or {}).get(
+                    "canon_branch_parent_hash"
+                )
+                or ""
+            )
+
+            self._canon_branch_record_candidate(
+                session_id=session_id,
+                round_id=round_id,
+                parent_hash=_cb_parent_hash,
+                user_text=_cb_user_text,
+                assistant_text=_cb_assistant_text,
+            )
+
+        except Exception as _cb_exc:
+            logger.warning(
+                "CanonBranch candidate record failed | session=%s round=%s error=%s",
+                session_id,
+                round_id,
+                _cb_exc,
+            )
+
         if isinstance(upstream_usage, dict) and upstream_usage:
             try:
                 self.state_store.record_upstream_usage(
@@ -4913,7 +5383,15 @@ class GatewayService:
         user_message: str,
         assistant_message: dict[str, Any] | None,
         recalled_ids: list[str],
+        canon_confirmed: bool = False,
     ) -> None:
+        if not canon_confirmed:
+            logger.info(
+                "Persona post-reply update deferred | session=%s reason=awaiting_canon_branch",
+                session_id,
+            )
+            return
+
         if not self.persona_engine.enabled:
             logger.info(
                 "Persona post-reply update skipped | session=%s reason=disabled",
@@ -4928,7 +5406,7 @@ class GatewayService:
         except (TypeError, ValueError):
             evaluation_interval = 3
         current_round = self.state_store.get_current_round(session_id)
-        if current_round > 0 and current_round % evaluation_interval != 0:
+        if (not canon_confirmed) and current_round > 0 and current_round % evaluation_interval != 0:
             logger.info(
                 "Persona post-reply update skipped | session=%s round=%s interval=%s reason=interval",
                 session_id,
