@@ -1860,7 +1860,10 @@ class GatewayService:
             include_favorite_memory = marker_favorite or self._truthy_header(
                 request.headers.get("X-Ombre-Include-Favorite-Memory")
             )
-            persona_user_message = self._extract_last_user_query(payload.get("messages", []))
+            messages = payload.get("messages", [])
+            await self._canon_branch_confirm_from_messages(session_id, messages)
+            canon_branch_parent_hash = self._canon_branch_request_hash(messages)
+            persona_user_message = self._extract_last_user_query(messages)
             forward_payload, recalled_ids, injection_debug = await self.prepare_payload(
                 payload,
                 session_id,
