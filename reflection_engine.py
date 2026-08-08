@@ -4512,18 +4512,82 @@ class ReflectionEngine:
     def _parse_json_object(self, raw: str) -> dict:
         cleaned = str(raw or "").strip()
 
+        if not cleaned:
+            return {}
+
+        # 去掉 Markdown JSON 代码块
         if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            lines = cleaned.splitlines()
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
 
         attempts = [cleaned]
 
-        # 有些模型会输出：
+        # 常见情况：
         # "candidates": [...]
-        # 但漏掉最外层的大括号，这里自动补上。
         if cleaned.startswith('"candidates"') and not cleaned.startswith("{"):
             attempts.append("{" + cleaned + "}")
 
+        # 有时模型在 JSON 前后夹解释文字。
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+        if first_brace >= 0 and last_brace > first_brace:
+            attempts.append(cleaned[first_brace:last_brace + 1])
+
+        # 最重要的兜底：
+        # 直接找到 "candidates": [ ... ] 并提取完整数组。
+        key_pos = cleaned.find('"candidates"')
+        if key_pos >= 0:
+            array_start = cleaned.find("[", key_pos)
+
+            if array_start >= 0:
+                depth = 0
+                in_string = False
+                escaped = False
+                array_end = -1
+
+                for i in range(array_start, len(cleaned)):
+                    ch = cleaned[i]
+
+                    if in_string:
+                        if escaped:
+                            escaped = False
+                        elif ch == "\\":
+                            escaped = True
+                        elif ch == '"':
+                            in_string = False
+                        continue
+
+                    if ch == '"':
+                        in_string = True
+                    elif ch == "[":
+                        depth += 1
+                    elif ch == "]":
+                        depth -= 1
+                        if depth == 0:
+                            array_end = i
+                            break
+
+                if array_end >= 0:
+                    array_text = cleaned[array_start:array_end + 1]
+                    attempts.append(
+                        '{"candidates":' + array_text + '}'
+                    )
+
+        # 去重后逐个尝试
+        seen = set()
+
         for candidate in attempts:
+            candidate = candidate.strip()
+
+            if not candidate or candidate in seen:
+                continue
+
+            seen.add(candidate)
+
             try:
                 parsed = json.loads(candidate)
                 if isinstance(parsed, dict):
@@ -4531,7 +4595,10 @@ class ReflectionEngine:
             except (json.JSONDecodeError, ValueError):
                 pass
 
-        logger.warning("Reflection JSON parse failed: %s", raw[:500])
+        logger.warning(
+            "Reflection JSON parse failed: %s",
+            cleaned[:1000],
+        )
         return {}
 
     @staticmethod
