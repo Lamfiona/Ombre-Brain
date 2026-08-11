@@ -3889,7 +3889,9 @@ class GatewayService:
                 role = str(item.get("role") or "").strip()
                 if role not in {"user", "assistant"}:
                     continue
-                content = self._coerce_message_text(item.get("content")).strip()
+                content = self._clean_conversation_turn_text(
+                    self._coerce_message_text(item.get("content"))
+                )
                 if content:
                     rows.append([role, content])
 
@@ -3918,7 +3920,9 @@ class GatewayService:
                 if role not in {"user", "assistant"}:
                     continue
 
-                content = self._coerce_message_text(item.get("content")).strip()
+                content = self._clean_conversation_turn_text(
+                    self._coerce_message_text(item.get("content"))
+                )
 
                 if content:
                     rows.append((role, content))
@@ -3948,9 +3952,22 @@ class GatewayService:
         if not user_text or not assistant_text:
             return None
 
+        parent_rows = [
+            [role, content]
+            for role, content in rows[:assistant_index]
+        ]
+        parent_hash = hashlib.sha256(
+            json.dumps(
+                parent_rows,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest() if parent_rows else ""
+
         return {
             "user_text": user_text,
             "assistant_text": assistant_text,
+            "parent_hash": parent_hash,
             "user_hash": hashlib.sha256(
                 user_text.encode("utf-8")
             ).hexdigest(),
@@ -4076,11 +4093,223 @@ class GatewayService:
                 ),
             ).fetchone()
 
+            edit_fallback = False
+            edit_fallback_score = 1.0
+
             if not row:
-                return
+                selected_parent_hash = str(
+                    selected.get("parent_hash") or ""
+                )
+                if not selected_parent_hash:
+                    return
+
+                fallback_rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM canon_branch_candidates
+                    WHERE session_id = ?
+                      AND parent_hash = ?
+                      AND confirmed = 0
+                    ORDER BY round_id DESC
+                    LIMIT 20
+                    """,
+                    (
+                        session_id,
+                        selected_parent_hash,
+                    ),
+                ).fetchall()
+
+                if not fallback_rows:
+                    return
+
+                from difflib import SequenceMatcher
+
+                scored_rows = sorted(
+                    (
+                        (
+                            SequenceMatcher(
+                                None,
+                                str(item["assistant_text"] or ""),
+                                selected["assistant_text"],
+                            ).ratio(),
+                            item,
+                        )
+                        for item in fallback_rows
+                    ),
+                    key=lambda pair: pair[0],
+                    reverse=True,
+                )
+
+                edit_fallback_score, row = scored_rows[0]
+
+                second_score = (
+                    scored_rows[1][0]
+                    if len(scored_rows) > 1
+                    else 0.0
+                )
+
+                # 编辑后的回答必须和某个候选足够相似。
+                # 如果太不像，或者前两名太接近，就不要猜。
+                if edit_fallback_score < 0.55:
+                    logger.info(
+                        "CanonBranch EDIT FALLBACK SKIP | "
+                        "session=%s reason=low_similarity score=%.3f",
+                        session_id,
+                        edit_fallback_score,
+                    )
+                    return
+
+                if (
+                    len(scored_rows) > 1
+                    and edit_fallback_score - second_score < 0.08
+                ):
+                    logger.info(
+                        "CanonBranch EDIT FALLBACK SKIP | "
+                        "session=%s reason=ambiguous best=%.3f second=%.3f",
+                        session_id,
+                        edit_fallback_score,
+                        second_score,
+                    )
+                    return
+
+                edit_fallback = True
 
             selected_round = int(row["round_id"])
             parent_hash = str(row["parent_hash"])
+
+            if edit_fallback:
+                # Canon 表改成 Kelivo 当前真正留下的版本
+                conn.execute(
+                    """
+                    UPDATE canon_branch_candidates
+                    SET user_hash = ?,
+                        assistant_hash = ?,
+                        user_text = ?,
+                        assistant_text = ?
+                    WHERE session_id = ?
+                      AND round_id = ?
+                    """,
+                    (
+                        selected["user_hash"],
+                        selected["assistant_hash"],
+                        selected["user_text"],
+                        selected["assistant_text"],
+                        session_id,
+                        selected_round,
+                    ),
+                )
+
+                # Recent Continuity 也同步最终版本
+                conn.execute(
+                    """
+                    UPDATE conversation_turns
+                    SET user_text = ?,
+                        assistant_text = ?
+                    WHERE session_id = ?
+                      AND round_id = ?
+                    """,
+                    (
+                        self._clip_text(selected["user_text"], 4000),
+                        self._clip_text(selected["assistant_text"], 4000),
+                        session_id,
+                        selected_round,
+                    ),
+                )
+
+                # raw_events 同步最终版本，避免自动记忆仍吃到编辑前废稿
+                raw_conn = self.raw_event_store._connect()
+                try:
+                    raw_rows = raw_conn.execute(
+                        """
+                        SELECT id, source, source_event_id, role,
+                               created_at, conversation_id,
+                               session_id, metadata_json
+                        FROM raw_events
+                        WHERE source = 'gateway'
+                          AND session_id = ?
+                        """,
+                        (session_id,),
+                    ).fetchall()
+
+                    changed_raw = 0
+
+                    for raw_row in raw_rows:
+                        try:
+                            meta = json.loads(
+                                raw_row["metadata_json"] or "{}"
+                            )
+                            raw_round = int(meta.get("round_id"))
+                        except Exception:
+                            continue
+
+                        if raw_round != selected_round:
+                            continue
+
+                        role = str(raw_row["role"] or "")
+                        if role == "user":
+                            new_text = selected["user_text"]
+                        elif role == "assistant":
+                            new_text = selected["assistant_text"]
+                        else:
+                            continue
+
+                        new_event_hash = self.raw_event_store._event_hash(
+                            source=str(raw_row["source"] or ""),
+                            source_event_id=str(
+                                raw_row["source_event_id"] or ""
+                            ),
+                            role=role,
+                            text=new_text,
+                            created_at=str(raw_row["created_at"] or ""),
+                            conversation_id=str(
+                                raw_row["conversation_id"] or ""
+                            ),
+                            session_id=str(raw_row["session_id"] or ""),
+                        )
+
+                        raw_conn.execute(
+                            """
+                            UPDATE raw_events
+                            SET text = ?,
+                                event_hash = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                new_text,
+                                new_event_hash,
+                                int(raw_row["id"]),
+                            ),
+                        )
+                        changed_raw += 1
+
+                    if (
+                        changed_raw
+                        and getattr(
+                            self.raw_event_store,
+                            "fts_enabled",
+                            False,
+                        )
+                    ):
+                        raw_conn.execute(
+                            """
+                            INSERT INTO raw_events_fts(
+                                raw_events_fts
+                            )
+                            VALUES('rebuild')
+                            """
+                        )
+
+                    raw_conn.commit()
+                finally:
+                    raw_conn.close()
+
+                logger.info(
+                    "CanonBranch EDIT FALLBACK | "
+                    "session=%s selected_round=%s similarity=%.3f",
+                    session_id,
+                    selected_round,
+                    edit_fallback_score,
+                )
 
             sibling_rows = conn.execute(
                 """
